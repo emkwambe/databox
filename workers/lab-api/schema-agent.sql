@@ -71,3 +71,17 @@ CREATE INDEX IF NOT EXISTS idx_agent_databases_expiry ON agent_databases(status,
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_databases_idem
   ON agent_databases(api_key_id, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
+
+-- ── agent_rate_limits ───────────────────────────────────────
+-- Sliding-window rate limiting per key (Day 2). window_start is the
+-- unix-epoch-seconds start of a fixed 60s bucket; the limiter reads the
+-- current + previous bucket and weights the previous one by overlap to
+-- approximate a sliding window. Rows for old windows are pruned on read.
+CREATE TABLE IF NOT EXISTS agent_rate_limits (
+  key_id        TEXT NOT NULL,
+  window_start  INTEGER NOT NULL,   -- unix epoch seconds, floored to 60s
+  request_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (key_id, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_rate_limits_window ON agent_rate_limits(window_start);

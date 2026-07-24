@@ -4286,20 +4286,148 @@ async function releaseExpiredAgentDatabases(env: Env) {
 //   GET    /v1/agent/databases/:id (poll status / fetch handle)
 // ============================================================
 
-// Per-tier ceilings applied when a key is minted. Mirrors the
-// pricing table in CLAIMABLE-DATABASE-AGENT-API-DESIGN.md.
-const AGENT_TIER_LIMITS: Record<string, { maxRows: number; maxTtlSeconds: number; monthlyClaimLimit: number }> = {
-  free:      { maxRows: 5000,   maxTtlSeconds: 1800,   monthlyClaimLimit: 50 },      // 30 min
-  developer: { maxRows: 50000,  maxTtlSeconds: 7200,   monthlyClaimLimit: 500 },     // 2 h
-  team:      { maxRows: 100000, maxTtlSeconds: 28800,  monthlyClaimLimit: 3000 },    // 8 h
-  agent:     { maxRows: 100000, maxTtlSeconds: 86400,  monthlyClaimLimit: 1000000 }, // metered
+// Per-tier ceilings. maxRows/maxTtlSeconds/monthlyClaimLimit are baked
+// onto a key when it is minted; concurrentLimit and rateLimitPerMinute
+// are derived from the key's tier at request time (so they apply to
+// keys minted before Day 2 without a migration). -1 = unlimited.
+// Mirrors the pricing table in CLAIMABLE-DATABASE-AGENT-API-DESIGN.md.
+const AGENT_TIER_LIMITS: Record<string, { maxRows: number; maxTtlSeconds: number; monthlyClaimLimit: number; concurrentLimit: number; rateLimitPerMinute: number }> = {
+  free:      { maxRows: 5000,   maxTtlSeconds: 1800,   monthlyClaimLimit: 50,      concurrentLimit: 2,  rateLimitPerMinute: 10 },   // 30 min
+  developer: { maxRows: 50000,  maxTtlSeconds: 7200,   monthlyClaimLimit: 500,     concurrentLimit: 5,  rateLimitPerMinute: 60 },   // 2 h
+  team:      { maxRows: 100000, maxTtlSeconds: 28800,  monthlyClaimLimit: 3000,    concurrentLimit: 20, rateLimitPerMinute: 300 },  // 8 h
+  agent:     { maxRows: 100000, maxTtlSeconds: 86400,  monthlyClaimLimit: 1000000, concurrentLimit: -1, rateLimitPerMinute: -1 },   // metered / unlimited
 };
+
+// Resolve the live tier limits for a key row, falling back to free.
+function agentTierLimits(tier: string) {
+  return AGENT_TIER_LIMITS[tier] || AGENT_TIER_LIMITS.free;
+}
 
 // Templates the agent API will provision. Row counts are validated
 // against R2 at request time (a template-rows combo only works if the
 // pre-generated SQL exists in the bucket); this list drives the
 // self-correcting error message and the future list_templates tool.
 const AGENT_TEMPLATES = ['banking', 'us-banking', 'oncology', 'healthcare', 'supply-chain', 'aml', 'fintech', 'telecom', 'universal', 'eu-banking', 'eu-healthcare', 'eu-telecom'];
+
+// Human-facing display metadata for the pack catalog (GET /v1/agent/packs).
+// The provisionable row bounds are NOT taken from here — they are derived
+// at request time from DATASET_PRICING (the existing source of truth for
+// which template+rows combos exist). This map only supplies the label,
+// blurb, table count, and compliance tags a catalog needs.
+const AGENT_PACK_METADATA: Record<string, { name: string; description: string; tables: number; compliance: string[] }> = {
+  banking:        { name: 'Banking',            description: 'Retail banking: customers, accounts, transactions, cards, loans.',        tables: 16, compliance: ['SOC2', 'PCI-DSS'] },
+  'us-banking':   { name: 'US Banking',         description: 'US retail banking with ACH, wires, and Reg-compliant account types.',     tables: 16, compliance: ['SOC2', 'PCI-DSS'] },
+  oncology:       { name: 'Oncology',           description: 'Cancer care: patients, diagnoses, treatments, labs, clinical trials.',    tables: 20, compliance: ['HIPAA'] },
+  healthcare:     { name: 'Healthcare',         description: 'General healthcare: encounters, providers, claims, prescriptions.',       tables: 20, compliance: ['HIPAA'] },
+  'supply-chain': { name: 'Supply Chain',       description: 'Suppliers, warehouses, shipments, inventory, purchase orders.',           tables: 24, compliance: ['SOC2'] },
+  aml:            { name: 'AML / Fraud',        description: 'Anti-money-laundering: entities, transfers, alerts, SAR cases.',          tables: 18, compliance: ['SOC2', 'BSA-AML'] },
+  fintech:        { name: 'Fintech',            description: 'Neobank / wallet: users, ledgers, payments, KYC records.',                tables: 16, compliance: ['SOC2', 'PCI-DSS'] },
+  telecom:        { name: 'Telecom',            description: 'Subscribers, plans, CDRs, billing, network usage.',                       tables: 18, compliance: ['SOC2'] },
+  universal:      { name: 'Universal',          description: 'Domain-agnostic relational sampler for generic SQL testing.',             tables: 12, compliance: [] },
+  'eu-banking':   { name: 'EU Banking',         description: 'SEPA / PSD2 retail banking with GDPR-shaped personal data.',              tables: 16, compliance: ['GDPR', 'PSD2'] },
+  'eu-healthcare':{ name: 'EU Healthcare',      description: 'EU healthcare records with GDPR special-category handling.',              tables: 20, compliance: ['GDPR'] },
+  'eu-telecom':   { name: 'EU Telecom',         description: 'EU telecom with GDPR consent and retention modelling.',                   tables: 18, compliance: ['GDPR'] },
+};
+
+// Convert a DATASET_PRICING row label ('5k','100k','1000k') to a number.
+function parseRowLabelToNumber(label: string): number {
+  const m = label.match(/^(\d+)k$/);
+  if (m) return parseInt(m[1], 10) * 1000;
+  return parseInt(label, 10) || 0;
+}
+
+// Build the pack catalog from the existing DATASET_PRICING config (the
+// source of truth for provisionable template+rows combos). Row bounds
+// come from the price tiers; display fields from AGENT_PACK_METADATA.
+function buildAgentPackCatalog() {
+  const packs = [];
+  for (const [id, tiers] of Object.entries(DATASET_PRICING)) {
+    const rowCounts = Object.keys(tiers).map(parseRowLabelToNumber).filter((n) => n > 0).sort((a, b) => a - b);
+    if (rowCounts.length === 0) continue;
+    const meta = AGENT_PACK_METADATA[id] || { name: id, description: `${id} synthetic dataset.`, tables: 0, compliance: [] };
+    packs.push({
+      id,
+      name: meta.name,
+      description: meta.description,
+      tables: meta.tables,
+      max_rows: rowCounts[rowCounts.length - 1],
+      min_rows: rowCounts[0],
+      default_rows: rowCounts[0], // smallest tier (the free 5k) is the default
+      compliance: meta.compliance,
+      docs_url: `https://realitydb.dev/docs/packs/${id}`,
+    });
+  }
+  return packs;
+}
+
+// Structured agent-endpoint error. Every agent error carries a stable
+// snake_case code, a human message, and a docs_url; upgrade_url and any
+// extra fields are merged in when relevant.
+function agentError(c: any, status: any, code: string, message: string, extra?: Record<string, unknown>) {
+  return c.json({
+    error: code,
+    message,
+    docs_url: `https://realitydb.dev/docs/agent/errors#${code}`,
+    ...(extra || {}),
+  }, status);
+}
+
+// Sliding-window rate limiter (Day 2). Fixed 60s buckets in
+// agent_rate_limits; the current + previous bucket are read and the
+// previous is weighted by how much of the current minute has elapsed —
+// a standard sliding-window-counter approximation. Returns whether the
+// request is allowed and the tier limit. Unlimited tiers short-circuit.
+async function checkRateLimit(env: Env, keyId: string, tier: string): Promise<{ allowed: boolean; limit: number; count: number }> {
+  const limit = agentTierLimits(tier).rateLimitPerMinute;
+  if (limit < 0) return { allowed: true, limit: -1, count: 0 };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const curWin = nowSec - (nowSec % 60);
+  const prevWin = curWin - 60;
+
+  const rows = await env.DB.prepare(
+    'SELECT window_start, request_count FROM agent_rate_limits WHERE key_id = ? AND window_start IN (?, ?)'
+  ).bind(keyId, curWin, prevWin).all();
+
+  let cur = 0, prev = 0;
+  for (const r of (rows.results || []) as any[]) {
+    if (r.window_start === curWin) cur = r.request_count as number;
+    else if (r.window_start === prevWin) prev = r.request_count as number;
+  }
+
+  const elapsed = nowSec - curWin;            // 0..59 into the current bucket
+  const weight = (60 - elapsed) / 60;
+  const estimated = prev * weight + cur;
+
+  if (estimated >= limit) {
+    return { allowed: false, limit, count: Math.floor(estimated) };
+  }
+
+  // Count this request against the current bucket and prune old buckets.
+  await env.DB.prepare(
+    `INSERT INTO agent_rate_limits (key_id, window_start, request_count) VALUES (?, ?, 1)
+     ON CONFLICT(key_id, window_start) DO UPDATE SET request_count = request_count + 1`
+  ).bind(keyId, curWin).run();
+  await env.DB.prepare('DELETE FROM agent_rate_limits WHERE key_id = ? AND window_start < ?').bind(keyId, prevWin).run();
+
+  return { allowed: true, limit, count: cur + 1 };
+}
+
+// Count a key's currently-live databases (READY and not yet expired).
+async function countActiveAgentDatabases(env: Env, keyId: string): Promise<number> {
+  const now = new Date().toISOString();
+  const r = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM agent_databases WHERE api_key_id = ? AND status = 'READY' AND expires_at > ?"
+  ).bind(keyId, now).first();
+  return parseInt((r as any)?.c || '0', 10);
+}
+
+// The 429 body for a tripped rate limit — shared by all agent endpoints.
+function rateLimitError(c: any, tier: string, limit: number) {
+  return agentError(c, 429, 'rate_limit_exceeded',
+    `Rate limit exceeded: ${limit} requests/minute on the ${tier} tier. Slow down or upgrade your plan.`,
+    { limit, tier, upgrade_url: 'https://realitydb.dev/pricing' });
+}
 
 // SHA-256 hex — agent keys are stored hashed, never in plaintext.
 async function sha256Hex(input: string): Promise<string> {
@@ -4401,7 +4529,7 @@ async function authenticateAgentKey(env: Env, rawKey: string | undefined): Promi
 app.post('/v1/agent/keys', async (c) => {
   const env = c.env;
   const apiKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
-  if (!authenticate(apiKey, env)) return c.json({ error: 'Unauthorized' }, 401);
+  if (!authenticate(apiKey, env)) return agentError(c, 401, 'unauthorized', 'Minting agent keys requires the master API key.');
 
   const body = await c.req.json<{ owner_id?: string; name?: string; tier?: string }>().catch(() => ({} as any));
   const tier = (body.tier && AGENT_TIER_LIMITS[body.tier]) ? body.tier : 'free';
@@ -4443,34 +4571,29 @@ app.post('/v1/agent/databases', async (c) => {
   const rawKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
   const key = await authenticateAgentKey(env, rawKey);
   if (!key) {
-    return c.json({
-      error: 'invalid_api_key',
-      message: 'Missing or invalid agent API key. Pass it as "Authorization: Bearer rdb_agent_..." or the X-API-Key header.',
-    }, 401);
+    return agentError(c, 401, 'invalid_api_key', 'Missing or invalid agent API key. Pass it as "Authorization: Bearer rdb_agent_..." or the X-API-Key header.');
   }
+
+  // Rate limit (per key, per tier).
+  const rl = await checkRateLimit(env, key.id as string, key.tier as string);
+  if (!rl.allowed) return rateLimitError(c, key.tier as string, rl.limit);
 
   const body = await c.req.json<{ template?: string; rows?: number; ttl_seconds?: number; seed?: number; idempotency_key?: string }>().catch(() => ({} as any));
 
   // Validate template.
   const template = body.template;
   if (!template || !AGENT_TEMPLATES.includes(template)) {
-    return c.json({
-      error: 'template_not_found',
-      message: `Template ${template ? `'${template}'` : '(missing)'} not found. Valid templates: ${AGENT_TEMPLATES.join(', ')}.`,
-      valid_templates: AGENT_TEMPLATES,
-    }, 400);
+    return agentError(c, 400, 'template_not_found',
+      `Template ${template ? `'${template}'` : '(missing)'} not found. Valid templates: ${AGENT_TEMPLATES.join(', ')}.`,
+      { valid_templates: AGENT_TEMPLATES });
   }
 
   // Validate rows against the key's ceiling.
   const rows = body.rows || 5000;
   if (rows > (key.max_rows as number)) {
-    return c.json({
-      error: 'rows_exceed_tier_limit',
-      message: `Requested ${rows} rows exceeds your ${key.tier} tier limit of ${key.max_rows}. Lower the row count or upgrade the key.`,
-      max_rows: key.max_rows,
-      tier: key.tier,
-      upgrade_url: 'https://realitydb.dev/pricing',
-    }, 403);
+    return agentError(c, 403, 'rows_exceed_tier_limit',
+      `Requested ${rows} rows exceeds your ${key.tier} tier limit of ${key.max_rows}. Lower the row count or upgrade the key.`,
+      { max_rows: key.max_rows, tier: key.tier, upgrade_url: 'https://realitydb.dev/pricing' });
   }
 
   // Validate TTL against the key's ceiling (default = ceiling).
@@ -4478,13 +4601,9 @@ app.post('/v1/agent/databases', async (c) => {
   let ttlSeconds = body.ttl_seconds ?? maxTtl;
   if (ttlSeconds < 60) ttlSeconds = 60;
   if (ttlSeconds > maxTtl) {
-    return c.json({
-      error: 'ttl_exceeds_tier_limit',
-      message: `Requested ttl_seconds ${ttlSeconds} exceeds your ${key.tier} tier limit of ${maxTtl}s. Lower ttl_seconds or upgrade the key.`,
-      max_ttl_seconds: maxTtl,
-      tier: key.tier,
-      upgrade_url: 'https://realitydb.dev/pricing',
-    }, 403);
+    return agentError(c, 403, 'ttl_exceeds_tier_limit',
+      `Requested ttl_seconds ${ttlSeconds} exceeds your ${key.tier} tier limit of ${maxTtl}s. Lower ttl_seconds or upgrade the key.`,
+      { max_ttl_seconds: maxTtl, tier: key.tier, upgrade_url: 'https://realitydb.dev/pricing' });
   }
 
   // Idempotency: a retried request with the same key returns the same
@@ -4498,14 +4617,21 @@ app.post('/v1/agent/databases', async (c) => {
 
   // Quota check (period already reset in authenticateAgentKey if stale).
   if ((key.claims_used_this_period as number) >= (key.monthly_claim_limit as number)) {
-    return c.json({
-      error: 'quota_exceeded',
-      message: `Monthly claim limit reached (${key.monthly_claim_limit} on the ${key.tier} tier). Upgrade or wait for the next period.`,
-      monthly_claim_limit: key.monthly_claim_limit,
-      claims_used_this_period: key.claims_used_this_period,
-      tier: key.tier,
-      upgrade_url: 'https://realitydb.dev/pricing',
-    }, 429);
+    return agentError(c, 429, 'quota_exceeded',
+      `Monthly claim limit reached (${key.monthly_claim_limit} on the ${key.tier} tier). Upgrade or wait for the next period.`,
+      { monthly_claim_limit: key.monthly_claim_limit, claims_used_this_period: key.claims_used_this_period, tier: key.tier, upgrade_url: 'https://realitydb.dev/pricing' });
+  }
+
+  // Concurrent-database limit: count this key's live (READY, unexpired)
+  // databases before provisioning another.
+  const concurrentLimit = agentTierLimits(key.tier as string).concurrentLimit;
+  if (concurrentLimit >= 0) {
+    const active = await countActiveAgentDatabases(env, key.id as string);
+    if (active >= concurrentLimit) {
+      return agentError(c, 429, 'concurrent_limit_exceeded',
+        'Release an active database or upgrade your plan',
+        { active, limit: concurrentLimit, upgrade_url: 'https://realitydb.dev/pricing' });
+    }
   }
 
   // Validate the template+rows combo exists in R2 before doing any work.
@@ -4513,12 +4639,9 @@ app.post('/v1/agent/databases', async (c) => {
   const r2Key = `templates/${template}-${rowLabel}.sql`;
   const templateObj = await env.TEMPLATES.get(r2Key);
   if (!templateObj) {
-    return c.json({
-      error: 'template_rows_unavailable',
-      message: `No pre-generated dataset for '${template}' at ${rows} rows (${r2Key}). Try a supported row count such as 5000, 10000, 50000, or 100000.`,
-      template,
-      requested_rows: rows,
-    }, 404);
+    return agentError(c, 404, 'template_rows_unavailable',
+      `No pre-generated dataset for '${template}' at ${rows} rows (${r2Key}). Try a supported row count such as 5000, 10000, 50000, or 100000.`,
+      { template, requested_rows: rows });
   }
 
   const id = 'adb-' + crypto.randomUUID().split('-')[0];
@@ -4538,7 +4661,7 @@ app.post('/v1/agent/databases', async (c) => {
         .bind(key.id, idem).first();
       if (winner) return c.json(agentClaimResponse(winner), 200);
     }
-    return c.json({ error: 'claim_insert_failed', message: e?.message || String(e) }, 500);
+    return agentError(c, 500, 'claim_insert_failed', e?.message || String(e));
   }
 
   let branch: { branchId: string; endpointId: string; host: string; connectionUri: string } | null = null;
@@ -4575,12 +4698,9 @@ app.post('/v1/agent/databases', async (c) => {
     }
     await env.DB.prepare("UPDATE agent_databases SET status = 'FAILED', error_message = ? WHERE id = ?")
       .bind(String(err?.message || err).substring(0, 500), id).run();
-    return c.json({
-      error: 'provisioning_failed',
-      message: `Failed to provision the database: ${err?.message || err}. The claim was not counted against your quota; retry with the same idempotency_key.`,
-      claim_id: id,
-      status: 'FAILED',
-    }, 500);
+    return agentError(c, 500, 'provisioning_failed',
+      `Failed to provision the database: ${err?.message || err}. The claim was not counted against your quota; retry with the same idempotency_key.`,
+      { claim_id: id, status: 'FAILED' });
   }
 });
 
@@ -4589,13 +4709,141 @@ app.get('/v1/agent/databases/:id', async (c) => {
   const env = c.env;
   const rawKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
   const key = await authenticateAgentKey(env, rawKey);
-  if (!key) return c.json({ error: 'invalid_api_key', message: 'Missing or invalid agent API key.' }, 401);
+  if (!key) return agentError(c, 401, 'invalid_api_key', 'Missing or invalid agent API key.');
+
+  const rl = await checkRateLimit(env, key.id as string, key.tier as string);
+  if (!rl.allowed) return rateLimitError(c, key.tier as string, rl.limit);
 
   const row = await env.DB.prepare('SELECT * FROM agent_databases WHERE id = ?').bind(c.req.param('id')).first();
   if (!row || row.api_key_id !== key.id) {
-    return c.json({ error: 'database_not_found', message: `No claimed database with id '${c.req.param('id')}' for this key.` }, 404);
+    return agentError(c, 404, 'database_not_found', `No claimed database with id '${c.req.param('id')}' for this key.`);
   }
   return c.json(agentClaimResponse(row));
+});
+
+// ISO timestamp when the current monthly quota window resets (30 days
+// after the period started).
+function agentPeriodResetAt(periodStart: string | null | undefined): string {
+  const start = periodStart ? new Date(periodStart) : new Date();
+  return new Date(start.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+}
+
+// ENDPOINT 1 — list this key's live databases, with quota summary.
+app.get('/v1/agent/databases', async (c) => {
+  const env = c.env;
+  const rawKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
+  const key = await authenticateAgentKey(env, rawKey);
+  if (!key) return agentError(c, 401, 'invalid_api_key', 'Missing or invalid agent API key.');
+
+  const rl = await checkRateLimit(env, key.id as string, key.tier as string);
+  if (!rl.allowed) return rateLimitError(c, key.tier as string, rl.limit);
+
+  const nowMs = Date.now();
+  const result = await env.DB.prepare(
+    "SELECT * FROM agent_databases WHERE api_key_id = ? AND status != 'RELEASED' ORDER BY created_at DESC LIMIT 200"
+  ).bind(key.id).all();
+
+  const statusMap: Record<string, string> = { READY: 'active', PENDING: 'pending', FAILED: 'failed' };
+  const databases = ((result.results || []) as any[])
+    .filter((r) => !(r.status === 'READY' && r.expires_at && new Date(r.expires_at).getTime() <= nowMs)) // drop expired-but-unreaped
+    .map((r) => {
+      const expMs = r.expires_at ? new Date(r.expires_at).getTime() : 0;
+      return {
+        database_id: r.id,
+        status: statusMap[r.status as string] || (r.status as string).toLowerCase(),
+        pack: r.template,
+        rows: r.rows_seeded ?? r.rows ?? 0,
+        claimed_at: r.created_at,
+        expires_at: r.expires_at,
+        ttl_remaining_seconds: r.status === 'READY' ? Math.max(0, Math.floor((expMs - nowMs) / 1000)) : 0,
+      };
+    });
+
+  return c.json({
+    databases,
+    total: databases.length,
+    quota: {
+      used: key.claims_used_this_period,
+      limit: key.monthly_claim_limit,
+      reset_at: agentPeriodResetAt(key.period_start as string),
+    },
+  });
+});
+
+// ENDPOINT 2 — release a database early. Must belong to the key. Deletes
+// the Neon branch (best-effort) and marks RELEASED. Quota is NOT refunded.
+app.delete('/v1/agent/databases/:id', async (c) => {
+  const env = c.env;
+  const rawKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
+  const key = await authenticateAgentKey(env, rawKey);
+  if (!key) return agentError(c, 401, 'invalid_api_key', 'Missing or invalid agent API key.');
+
+  const rl = await checkRateLimit(env, key.id as string, key.tier as string);
+  if (!rl.allowed) return rateLimitError(c, key.tier as string, rl.limit);
+
+  const id = c.req.param('id');
+  const row = await env.DB.prepare('SELECT * FROM agent_databases WHERE id = ?').bind(id).first();
+  if (!row || row.api_key_id !== key.id) {
+    return agentError(c, 404, 'database_not_found', `No claimed database with id '${id}' for this key.`);
+  }
+
+  // Idempotent: already released -> report the existing release.
+  if (row.status === 'RELEASED') {
+    return c.json({ database_id: id, status: 'released', released_at: row.released_at });
+  }
+
+  // Tear down the Neon branch (best-effort — a failed delete must not
+  // block marking the claim released).
+  if (row.neon_branch_id) {
+    try { await deleteNeonBranch(env.NEON_PROJECT_ID, env.NEON_API_KEY, row.neon_branch_id as string); } catch { /* ignore */ }
+  }
+
+  const releasedAt = new Date().toISOString();
+  await env.DB.prepare("UPDATE agent_databases SET status = 'RELEASED', released_at = ? WHERE id = ?")
+    .bind(releasedAt, id).run();
+
+  // NOTE: quota (claims_used_this_period) is intentionally NOT decremented.
+  return c.json({ database_id: id, status: 'released', released_at: releasedAt });
+});
+
+// ENDPOINT 3 — list available domain packs. Built from DATASET_PRICING
+// (the existing provisionable-combos config), not a hardcoded array.
+app.get('/v1/agent/packs', async (c) => {
+  const env = c.env;
+  const rawKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
+  const key = await authenticateAgentKey(env, rawKey);
+  if (!key) return agentError(c, 401, 'invalid_api_key', 'Missing or invalid agent API key.');
+
+  const rl = await checkRateLimit(env, key.id as string, key.tier as string);
+  if (!rl.allowed) return rateLimitError(c, key.tier as string, rl.limit);
+
+  const packs = buildAgentPackCatalog();
+  return c.json({ packs, total: packs.length });
+});
+
+// ENDPOINT 4 — current quota / plan details for this key.
+app.get('/v1/agent/quota', async (c) => {
+  const env = c.env;
+  const rawKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
+  const key = await authenticateAgentKey(env, rawKey);
+  if (!key) return agentError(c, 401, 'invalid_api_key', 'Missing or invalid agent API key.');
+
+  const rl = await checkRateLimit(env, key.id as string, key.tier as string);
+  if (!rl.allowed) return rateLimitError(c, key.tier as string, rl.limit);
+
+  const limits = agentTierLimits(key.tier as string);
+  const concurrentActive = await countActiveAgentDatabases(env, key.id as string);
+
+  return c.json({
+    plan: key.tier,
+    databases_this_period: key.claims_used_this_period,
+    databases_limit: key.monthly_claim_limit,
+    concurrent_active: concurrentActive,
+    concurrent_limit: limits.concurrentLimit,
+    max_rows_per_claim: key.max_rows,
+    max_ttl_seconds: key.max_ttl_seconds,
+    period_reset_at: agentPeriodResetAt(key.period_start as string),
+  });
 });
 
 // Shape a claim row into the agent-friendly response envelope. Field
