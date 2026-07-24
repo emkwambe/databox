@@ -4250,10 +4250,382 @@ async function cleanupExpiredLabs(env: Env) {
   return { cleaned, total: expired.results?.length || 0 };
 }
 
+// Reap expired agent-claimed databases: delete the Neon branch and mark
+// the claim RELEASED. Same hourly cron as cleanupExpiredLabs. Idempotent
+// — a RELEASED row is never revisited.
+async function releaseExpiredAgentDatabases(env: Env) {
+  const now = new Date().toISOString();
+  const expired = await env.DB.prepare(
+    "SELECT id, neon_branch_id FROM agent_databases WHERE status = 'READY' AND expires_at < ?"
+  ).bind(now).all();
+
+  let released = 0;
+  for (const db of (expired.results || [])) {
+    try {
+      if (db.neon_branch_id) {
+        await deleteNeonBranch(env.NEON_PROJECT_ID, env.NEON_API_KEY, db.neon_branch_id as string);
+      }
+      await env.DB.prepare("UPDATE agent_databases SET status = 'RELEASED', released_at = ? WHERE id = ?")
+        .bind(now, db.id).run();
+      released++;
+    } catch (err) {
+      console.error(`Failed to release agent database ${db.id}:`, err);
+    }
+  }
+  return { released, total: expired.results?.length || 0 };
+}
+
+// ============================================================
+// CLAIMABLE DATABASE AGENT API  (Day 1)
+// Agent-native façade over the existing SimLab provisioning
+// pipeline (createNeonBranch + R2 template seed). Identity is an
+// agent API key (SHA-256 hashed at rest); responses use
+// self-describing field names per the design doc.
+//   POST   /v1/agent/keys        (admin: mint an agent key)
+//   POST   /v1/agent/databases   (claim a seeded database)
+//   GET    /v1/agent/databases/:id (poll status / fetch handle)
+// ============================================================
+
+// Per-tier ceilings applied when a key is minted. Mirrors the
+// pricing table in CLAIMABLE-DATABASE-AGENT-API-DESIGN.md.
+const AGENT_TIER_LIMITS: Record<string, { maxRows: number; maxTtlSeconds: number; monthlyClaimLimit: number }> = {
+  free:      { maxRows: 5000,   maxTtlSeconds: 1800,   monthlyClaimLimit: 50 },      // 30 min
+  developer: { maxRows: 50000,  maxTtlSeconds: 7200,   monthlyClaimLimit: 500 },     // 2 h
+  team:      { maxRows: 100000, maxTtlSeconds: 28800,  monthlyClaimLimit: 3000 },    // 8 h
+  agent:     { maxRows: 100000, maxTtlSeconds: 86400,  monthlyClaimLimit: 1000000 }, // metered
+};
+
+// Templates the agent API will provision. Row counts are validated
+// against R2 at request time (a template-rows combo only works if the
+// pre-generated SQL exists in the bucket); this list drives the
+// self-correcting error message and the future list_templates tool.
+const AGENT_TEMPLATES = ['banking', 'us-banking', 'oncology', 'healthcare', 'supply-chain', 'aml', 'fintech', 'telecom', 'universal', 'eu-banking', 'eu-healthcare', 'eu-telecom'];
+
+// SHA-256 hex — agent keys are stored hashed, never in plaintext.
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Neon pooled host = endpoint host with "-pooler" inserted before the
+// first dot (ep-x-123.us-east-2.aws.neon.tech -> ep-x-123-pooler...).
+// Returns the same string unchanged if it can't be parsed.
+function derivePooledConnection(direct: string): string {
+  try {
+    const u = new URL(direct.replace('postgresql://', 'https://'));
+    if (u.hostname.includes('-pooler.')) return direct;
+    const pooledHost = u.hostname.replace('.', '-pooler.');
+    return direct.replace(u.hostname, pooledHost);
+  } catch {
+    return direct;
+  }
+}
+
+// Seed a freshly-created Neon branch from a pre-generated template SQL
+// string. Extracted from the proven /v1/labs path: one POST to Neon's
+// /sql transaction endpoint (avoids the 50-subrequest limit), with a
+// bounded per-statement fallback. Returns whether seeding succeeded.
+async function seedNeonBranchFromSql(connectionString: string, sqlText: string): Promise<{ ok: boolean; statements: number }> {
+  const connUrl = new URL(connectionString.replace('postgresql://', 'https://'));
+  const neonHost = connUrl.hostname;
+
+  const statements: string[] = [];
+  let current = '';
+  for (const line of sqlText.split('\n')) {
+    current += line + '\n';
+    if (line.trimEnd().endsWith(';') && !line.trim().startsWith('--')) {
+      const trimmed = current.trim();
+      if (trimmed && trimmed !== ';') statements.push(trimmed);
+      current = '';
+    }
+  }
+  if (current.trim()) statements.push(current.trim());
+
+  const txBody = JSON.stringify({
+    queries: statements.map((s) => ({ query: s.replace(/;\s*$/, ''), params: [] })),
+  });
+
+  const txRes = await fetch(`https://${neonHost}/sql`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Neon-Connection-String': connectionString,
+      'Neon-Raw-Text-Output': 'true',
+      'Neon-Array-Mode': 'true',
+      'Neon-Pool-Opt-In': 'true',
+    },
+    body: txBody,
+  });
+
+  if (txRes.ok) return { ok: true, statements: statements.length };
+
+  // Fallback: individual execution, capped under the subrequest limit.
+  const errText = await txRes.text();
+  console.error(`Agent seed: Neon SQL API error (${txRes.status}):`, errText.substring(0, 200));
+  const db = neon(connectionString);
+  let seeded = 0;
+  for (const stmt of statements.slice(0, 45)) {
+    const cleaned = stmt.replace(/;\s*$/, '');
+    if (!cleaned) continue;
+    try { await db(cleaned); seeded++; } catch { /* best-effort */ }
+  }
+  return { ok: seeded > 0, statements: seeded };
+}
+
+// Look up an agent key by hashing the presented raw key. Handles the
+// monthly quota window: if period_start is older than 30 days, the
+// counter is reset before the caller checks quota. Returns the row or
+// null (unknown / revoked).
+async function authenticateAgentKey(env: Env, rawKey: string | undefined): Promise<any | null> {
+  if (!rawKey || !rawKey.startsWith('rdb_agent_')) return null;
+  const hash = await sha256Hex(rawKey);
+  const key = await env.DB.prepare("SELECT * FROM agent_api_keys WHERE key_hash = ? AND status = 'active'").bind(hash).first();
+  if (!key) return null;
+
+  const now = new Date();
+  const periodStart = key.period_start ? new Date(key.period_start as string) : null;
+  const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+  if (!periodStart || now.getTime() - periodStart.getTime() > THIRTY_DAYS) {
+    await env.DB.prepare('UPDATE agent_api_keys SET claims_used_this_period = 0, period_start = ? WHERE id = ?')
+      .bind(now.toISOString(), key.id).run();
+    key.claims_used_this_period = 0;
+    key.period_start = now.toISOString();
+  }
+  return key;
+}
+
+// Admin: mint a new agent API key. Protected by the master LAB_API_KEY
+// (the same key that guards /v1/labs). Returns the raw key exactly once
+// — it is not recoverable afterward, only its hash is stored.
+app.post('/v1/agent/keys', async (c) => {
+  const env = c.env;
+  const apiKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
+  if (!authenticate(apiKey, env)) return c.json({ error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json<{ owner_id?: string; name?: string; tier?: string }>().catch(() => ({} as any));
+  const tier = (body.tier && AGENT_TIER_LIMITS[body.tier]) ? body.tier : 'free';
+  const limits = AGENT_TIER_LIMITS[tier];
+  const ownerId = body.owner_id || 'agent-user';
+
+  const rawKey = 'rdb_agent_' + crypto.randomUUID().replace(/-/g, '');
+  const keyHash = await sha256Hex(rawKey);
+  const keyPrefix = rawKey.substring(0, 18);
+  const id = 'akey-' + crypto.randomUUID().split('-')[0];
+  const now = new Date().toISOString();
+
+  await env.DB.prepare(
+    `INSERT INTO agent_api_keys (id, key_hash, key_prefix, name, owner_id, tier, monthly_claim_limit, claims_used_this_period, max_rows, max_ttl_seconds, status, period_start, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'active', ?, ?)`
+  ).bind(id, keyHash, keyPrefix, body.name || null, ownerId, tier, limits.monthlyClaimLimit, limits.maxRows, limits.maxTtlSeconds, now, now).run();
+
+  return c.json({
+    id,
+    api_key: rawKey,
+    key_prefix: keyPrefix,
+    tier,
+    owner_id: ownerId,
+    monthly_claim_limit: limits.monthlyClaimLimit,
+    max_rows: limits.maxRows,
+    max_ttl_seconds: limits.maxTtlSeconds,
+    warning: 'Store this key now — it will not be shown again.',
+    created_at: now,
+  }, 201);
+});
+
+// Claim a database: provision a Neon branch and seed it from the R2
+// template, returning a ready-to-use connection string. Wired directly
+// to the existing SimLab provisioning pipeline (createNeonBranch +
+// seedNeonBranchFromSql). Agent-friendly: self-describing fields,
+// structured self-correcting errors, idempotency-key dedupe.
+app.post('/v1/agent/databases', async (c) => {
+  const env = c.env;
+  const rawKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
+  const key = await authenticateAgentKey(env, rawKey);
+  if (!key) {
+    return c.json({
+      error: 'invalid_api_key',
+      message: 'Missing or invalid agent API key. Pass it as "Authorization: Bearer rdb_agent_..." or the X-API-Key header.',
+    }, 401);
+  }
+
+  const body = await c.req.json<{ template?: string; rows?: number; ttl_seconds?: number; seed?: number; idempotency_key?: string }>().catch(() => ({} as any));
+
+  // Validate template.
+  const template = body.template;
+  if (!template || !AGENT_TEMPLATES.includes(template)) {
+    return c.json({
+      error: 'template_not_found',
+      message: `Template ${template ? `'${template}'` : '(missing)'} not found. Valid templates: ${AGENT_TEMPLATES.join(', ')}.`,
+      valid_templates: AGENT_TEMPLATES,
+    }, 400);
+  }
+
+  // Validate rows against the key's ceiling.
+  const rows = body.rows || 5000;
+  if (rows > (key.max_rows as number)) {
+    return c.json({
+      error: 'rows_exceed_tier_limit',
+      message: `Requested ${rows} rows exceeds your ${key.tier} tier limit of ${key.max_rows}. Lower the row count or upgrade the key.`,
+      max_rows: key.max_rows,
+      tier: key.tier,
+      upgrade_url: 'https://realitydb.dev/pricing',
+    }, 403);
+  }
+
+  // Validate TTL against the key's ceiling (default = ceiling).
+  const maxTtl = key.max_ttl_seconds as number;
+  let ttlSeconds = body.ttl_seconds ?? maxTtl;
+  if (ttlSeconds < 60) ttlSeconds = 60;
+  if (ttlSeconds > maxTtl) {
+    return c.json({
+      error: 'ttl_exceeds_tier_limit',
+      message: `Requested ttl_seconds ${ttlSeconds} exceeds your ${key.tier} tier limit of ${maxTtl}s. Lower ttl_seconds or upgrade the key.`,
+      max_ttl_seconds: maxTtl,
+      tier: key.tier,
+      upgrade_url: 'https://realitydb.dev/pricing',
+    }, 403);
+  }
+
+  // Idempotency: a retried request with the same key returns the same
+  // claim instead of provisioning a second branch.
+  const idem = body.idempotency_key || null;
+  if (idem) {
+    const existing = await env.DB.prepare('SELECT * FROM agent_databases WHERE api_key_id = ? AND idempotency_key = ?')
+      .bind(key.id, idem).first();
+    if (existing) return c.json(agentClaimResponse(existing), 200);
+  }
+
+  // Quota check (period already reset in authenticateAgentKey if stale).
+  if ((key.claims_used_this_period as number) >= (key.monthly_claim_limit as number)) {
+    return c.json({
+      error: 'quota_exceeded',
+      message: `Monthly claim limit reached (${key.monthly_claim_limit} on the ${key.tier} tier). Upgrade or wait for the next period.`,
+      monthly_claim_limit: key.monthly_claim_limit,
+      claims_used_this_period: key.claims_used_this_period,
+      tier: key.tier,
+      upgrade_url: 'https://realitydb.dev/pricing',
+    }, 429);
+  }
+
+  // Validate the template+rows combo exists in R2 before doing any work.
+  const rowLabel = rows >= 1000 ? `${rows / 1000}k` : String(rows);
+  const r2Key = `templates/${template}-${rowLabel}.sql`;
+  const templateObj = await env.TEMPLATES.get(r2Key);
+  if (!templateObj) {
+    return c.json({
+      error: 'template_rows_unavailable',
+      message: `No pre-generated dataset for '${template}' at ${rows} rows (${r2Key}). Try a supported row count such as 5000, 10000, 50000, or 100000.`,
+      template,
+      requested_rows: rows,
+    }, 404);
+  }
+
+  const id = 'adb-' + crypto.randomUUID().split('-')[0];
+  const seed = body.seed ?? null;
+  const nowIso = new Date().toISOString();
+
+  // Record the PENDING claim (also reserves the idempotency key).
+  try {
+    await env.DB.prepare(
+      `INSERT INTO agent_databases (id, api_key_id, owner_id, template, rows, seed, status, idempotency_key, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`
+    ).bind(id, key.id, key.owner_id, template, rows, seed, idem, nowIso, nowIso).run();
+  } catch (e: any) {
+    // Unique idempotency collision from a concurrent retry — return the winner.
+    if (idem) {
+      const winner = await env.DB.prepare('SELECT * FROM agent_databases WHERE api_key_id = ? AND idempotency_key = ?')
+        .bind(key.id, idem).first();
+      if (winner) return c.json(agentClaimResponse(winner), 200);
+    }
+    return c.json({ error: 'claim_insert_failed', message: e?.message || String(e) }, 500);
+  }
+
+  let branch: { branchId: string; endpointId: string; host: string; connectionUri: string } | null = null;
+  try {
+    branch = await createNeonBranch(env.NEON_PROJECT_ID, env.NEON_API_KEY, id);
+    const sqlText = await templateObj.text();
+    await seedNeonBranchFromSql(branch.connectionUri, sqlText);
+
+    // Count seeded tables (single request; best-effort).
+    let tablesCount: number | null = null;
+    try {
+      const db = neon(branch.connectionUri);
+      const r = await db("SELECT COUNT(*)::int AS c FROM pg_tables WHERE schemaname = 'public'");
+      tablesCount = (r[0] as any)?.c ?? null;
+    } catch { /* non-fatal */ }
+
+    const readyAt = new Date();
+    const expiresAt = new Date(readyAt.getTime() + ttlSeconds * 1000);
+
+    await env.DB.prepare(
+      `UPDATE agent_databases SET status = 'READY', neon_branch_id = ?, neon_endpoint_id = ?, connection_string = ?, tables_count = ?, rows_seeded = ?, ready_at = ?, expires_at = ? WHERE id = ?`
+    ).bind(branch.branchId, branch.endpointId, branch.connectionUri, tablesCount, rows, readyAt.toISOString(), expiresAt.toISOString(), id).run();
+
+    // Meter the successful claim against the key's quota.
+    await env.DB.prepare('UPDATE agent_api_keys SET claims_used_this_period = claims_used_this_period + 1, last_used_at = ? WHERE id = ?')
+      .bind(readyAt.toISOString(), key.id).run();
+
+    const row = await env.DB.prepare('SELECT * FROM agent_databases WHERE id = ?').bind(id).first();
+    return c.json(agentClaimResponse(row), 201);
+  } catch (err: any) {
+    // Roll back: tear down the branch if it was created, mark FAILED.
+    if (branch?.branchId) {
+      try { await deleteNeonBranch(env.NEON_PROJECT_ID, env.NEON_API_KEY, branch.branchId); } catch { /* ignore */ }
+    }
+    await env.DB.prepare("UPDATE agent_databases SET status = 'FAILED', error_message = ? WHERE id = ?")
+      .bind(String(err?.message || err).substring(0, 500), id).run();
+    return c.json({
+      error: 'provisioning_failed',
+      message: `Failed to provision the database: ${err?.message || err}. The claim was not counted against your quota; retry with the same idempotency_key.`,
+      claim_id: id,
+      status: 'FAILED',
+    }, 500);
+  }
+});
+
+// Poll a claim's status / fetch its connection handle.
+app.get('/v1/agent/databases/:id', async (c) => {
+  const env = c.env;
+  const rawKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
+  const key = await authenticateAgentKey(env, rawKey);
+  if (!key) return c.json({ error: 'invalid_api_key', message: 'Missing or invalid agent API key.' }, 401);
+
+  const row = await env.DB.prepare('SELECT * FROM agent_databases WHERE id = ?').bind(c.req.param('id')).first();
+  if (!row || row.api_key_id !== key.id) {
+    return c.json({ error: 'database_not_found', message: `No claimed database with id '${c.req.param('id')}' for this key.` }, 404);
+  }
+  return c.json(agentClaimResponse(row));
+});
+
+// Shape a claim row into the agent-friendly response envelope. Field
+// names are self-describing per the design doc; connection strings are
+// only ever returned to the key that owns the claim.
+function agentClaimResponse(row: any) {
+  const expiresAt = row.expires_at ? new Date(row.expires_at as string) : null;
+  const ttlRemaining = expiresAt ? Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 1000)) : 0;
+  const direct = (row.status === 'READY' && row.connection_string) ? (row.connection_string as string) : null;
+  return {
+    claim_id: row.id,
+    status: row.status,
+    template: row.template,
+    rows_seeded: row.rows_seeded ?? row.rows ?? null,
+    tables: row.tables_count ?? null,
+    connection_string_pooled: direct ? derivePooledConnection(direct) : null,
+    connection_string_direct: direct,
+    expires_at_iso8601: row.expires_at ?? null,
+    ttl_seconds_remaining: ttlRemaining,
+    claim_url: `https://realitydb.dev/claim/${row.id}`,
+    compliance_doc_url: `https://realitydb.dev/compliance/${row.template}`,
+    error: row.status === 'FAILED' ? (row.error_message ?? 'provisioning_failed') : undefined,
+  };
+}
+
 // Export
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(cleanupExpiredLabs(env));
+    ctx.waitUntil(releaseExpiredAgentDatabases(env));
   },
 };
