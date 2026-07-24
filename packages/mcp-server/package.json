@@ -1,0 +1,40 @@
+{
+  "name": "@realitydb/mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for RealityDB Claimable Database Agent API",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "realitydb-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.24.0",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "realitydb",
+    "mcp",
+    "synthetic-data",
+    "database",
+    "agent",
+    "claude"
+  ],
+  "license": "MIT"
+}
