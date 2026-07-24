@@ -6,7 +6,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { RealityDBClient } from "./client.js";
+import { RealityDBClient, DEFAULT_BASE_URL } from "./client.js";
 import type { ToolDefinition } from "./types.js";
 import { claimTool } from "./tools/claim.js";
 import { releaseTool } from "./tools/release.js";
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
 
   const client = new RealityDBClient({
     apiKey,
-    baseUrl: process.env.REALITYDB_BASE_URL,
+    baseUrl: process.env.REALITYDB_BASE_URL || DEFAULT_BASE_URL,
   });
 
   const server = new Server(

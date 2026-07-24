@@ -32,6 +32,28 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
 }
 ```
 
+## Base URL
+
+Default: `https://realitydb-lab-api.eddy-078.workers.dev`
+Production (coming soon): `https://lab.realitydb.dev`
+
+To use a custom base URL, set `REALITYDB_BASE_URL`:
+
+```json
+{
+  "mcpServers": {
+    "realitydb": {
+      "command": "npx",
+      "args": ["-y", "@realitydb/mcp-server"],
+      "env": {
+        "REALITYDB_API_KEY": "rdb_agent_your_key",
+        "REALITYDB_BASE_URL": "https://lab.realitydb.dev"
+      }
+    }
+  }
+}
+```
+
 ## Available Tools
 
 - **claim_database** — Provision a live PostgreSQL database with synthetic data
@@ -45,7 +67,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
 | Variable | Required | Description |
 | --- | --- | --- |
 | `REALITYDB_API_KEY` | yes | Your agent API key (`rdb_agent_...`). May also be passed as `--api-key <key>`. |
-| `REALITYDB_BASE_URL` | no | Override the API base URL (defaults to `https://lab.realitydb.dev`). |
+| `REALITYDB_BASE_URL` | no | Override the API base URL (defaults to `https://realitydb-lab-api.eddy-078.workers.dev`). |
 
 ## Get an API Key
 
