@@ -6,10 +6,9 @@ import type {
   Quota,
 } from "./types.js";
 
-// The Claimable Database Agent API. Currently the direct workers.dev URL;
-// switches to https://lab.realitydb.dev once that custom domain is live.
-// Override with REALITYDB_BASE_URL (passed through as config.baseUrl).
-export const DEFAULT_BASE_URL = "https://realitydb-lab-api.eddy-078.workers.dev";
+// The Claimable Database Agent API production base URL. Override with
+// REALITYDB_BASE_URL (passed through as config.baseUrl).
+export const DEFAULT_BASE_URL = "https://lab.realitydb.dev";
 
 /**
  * Thin client over the RealityDB /v1/agent/* endpoints. Normalizes the
