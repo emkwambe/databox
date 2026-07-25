@@ -4291,11 +4291,15 @@ async function releaseExpiredAgentDatabases(env: Env) {
 // are derived from the key's tier at request time (so they apply to
 // keys minted before Day 2 without a migration). -1 = unlimited.
 // Mirrors the pricing table in CLAIMABLE-DATABASE-AGENT-API-DESIGN.md.
-const AGENT_TIER_LIMITS: Record<string, { maxRows: number; maxTtlSeconds: number; monthlyClaimLimit: number; concurrentLimit: number; rateLimitPerMinute: number }> = {
-  free:      { maxRows: 5000,   maxTtlSeconds: 1800,   monthlyClaimLimit: 50,      concurrentLimit: 2,  rateLimitPerMinute: 10 },   // 30 min
-  developer: { maxRows: 50000,  maxTtlSeconds: 7200,   monthlyClaimLimit: 500,     concurrentLimit: 5,  rateLimitPerMinute: 60 },   // 2 h
-  team:      { maxRows: 100000, maxTtlSeconds: 28800,  monthlyClaimLimit: 3000,    concurrentLimit: 20, rateLimitPerMinute: 300 },  // 8 h
-  agent:     { maxRows: 100000, maxTtlSeconds: 86400,  monthlyClaimLimit: 1000000, concurrentLimit: -1, rateLimitPerMinute: -1 },   // metered / unlimited
+const AGENT_TIER_LIMITS: Record<string, { maxRows: number; maxTtlSeconds: number; claimsPerPeriod: number; concurrentLimit: number; rateLimitPerMinute: number }> = {
+  free:       { claimsPerPeriod: 10,      maxRows: 5000,    maxTtlSeconds: 3600,    concurrentLimit: 1,  rateLimitPerMinute: 10 },   // 1 hour
+  starter:    { claimsPerPeriod: 100,     maxRows: 50000,   maxTtlSeconds: 86400,   concurrentLimit: 3,  rateLimitPerMinute: 60 },   // 24 hours
+  pro:        { claimsPerPeriod: 500,     maxRows: 500000,  maxTtlSeconds: 604800,  concurrentLimit: 10, rateLimitPerMinute: 300 },  // 7 days
+  enterprise: { claimsPerPeriod: 1000000, maxRows: 1000000, maxTtlSeconds: 2592000, concurrentLimit: 25, rateLimitPerMinute: -1 },   // 30 days · unlimited claims/rate
+  agent:      { claimsPerPeriod: 1000000, maxRows: 100000,  maxTtlSeconds: 86400,   concurrentLimit: -1, rateLimitPerMinute: -1 },   // metered / unlimited
+  // Back-compat aliases for keys minted under the pre-rename tier names.
+  developer:  { claimsPerPeriod: 100,     maxRows: 50000,   maxTtlSeconds: 86400,   concurrentLimit: 3,  rateLimitPerMinute: 60 },   // = starter
+  team:       { claimsPerPeriod: 500,     maxRows: 500000,  maxTtlSeconds: 604800,  concurrentLimit: 10, rateLimitPerMinute: 300 },  // = pro
 };
 
 // Resolve the live tier limits for a key row, falling back to free.
@@ -4545,7 +4549,7 @@ app.post('/v1/agent/keys', async (c) => {
   await env.DB.prepare(
     `INSERT INTO agent_api_keys (id, key_hash, key_prefix, name, owner_id, tier, monthly_claim_limit, claims_used_this_period, max_rows, max_ttl_seconds, status, period_start, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'active', ?, ?)`
-  ).bind(id, keyHash, keyPrefix, body.name || null, ownerId, tier, limits.monthlyClaimLimit, limits.maxRows, limits.maxTtlSeconds, now, now).run();
+  ).bind(id, keyHash, keyPrefix, body.name || null, ownerId, tier, limits.claimsPerPeriod, limits.maxRows, limits.maxTtlSeconds, now, now).run();
 
   return c.json({
     id,
@@ -4553,7 +4557,7 @@ app.post('/v1/agent/keys', async (c) => {
     key_prefix: keyPrefix,
     tier,
     owner_id: ownerId,
-    monthly_claim_limit: limits.monthlyClaimLimit,
+    monthly_claim_limit: limits.claimsPerPeriod,
     max_rows: limits.maxRows,
     max_ttl_seconds: limits.maxTtlSeconds,
     warning: 'Store this key now — it will not be shown again.',
