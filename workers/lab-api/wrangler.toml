@@ -16,3 +16,7 @@ ENVIRONMENT = "production"
 
 [triggers]
 crons = ["0 * * * *"]
+
+[[routes]]
+pattern = "lab.realitydb.dev"
+custom_domain = true
