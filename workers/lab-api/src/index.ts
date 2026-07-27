@@ -4311,7 +4311,10 @@ function agentTierLimits(tier: string) {
 // against R2 at request time (a template-rows combo only works if the
 // pre-generated SQL exists in the bucket); this list drives the
 // self-correcting error message and the future list_templates tool.
-const AGENT_TEMPLATES = ['banking', 'us-banking', 'oncology', 'healthcare', 'supply-chain', 'aml', 'fintech', 'telecom', 'universal', 'eu-banking', 'eu-healthcare', 'eu-telecom'];
+// 'banking' and 'aml' were removed on 2026-07-27: neither has any pack in
+// R2, so every claim against them failed the bucket check with
+// template_rows_unavailable. Re-add once their SQL is uploaded.
+const AGENT_TEMPLATES = ['us-banking', 'oncology', 'healthcare', 'supply-chain', 'fintech', 'telecom', 'universal', 'eu-banking', 'eu-healthcare', 'eu-telecom'];
 
 // Human-facing display metadata for the pack catalog (GET /v1/agent/packs).
 // The provisionable row bounds are NOT taken from here — they are derived
