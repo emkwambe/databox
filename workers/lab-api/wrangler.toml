@@ -16,6 +16,13 @@ database_id = "1fa51a0c-c851-4cec-8e91-ac1ee2079ff8"
 binding = "TEMPLATES"
 bucket_name = "realitydb-templates"
 
+# Short-lived cache for the R2-probed pack catalog (GET /v1/agent/packs).
+# Entries expire after 5 minutes; POST /v1/agent/packs/refresh clears them
+# on demand right after a pack is uploaded to R2.
+[[kv_namespaces]]
+binding = "KV"
+id = "5ca9d6e543a249f482e36c7a3877ca07"
+
 [vars]
 ENVIRONMENT = "production"
 

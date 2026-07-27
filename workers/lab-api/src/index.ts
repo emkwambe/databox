@@ -6,6 +6,7 @@ import { neon } from '@neondatabase/serverless';
 interface Env {
   DB: D1Database;
   TEMPLATES: R2Bucket;
+  KV?: KVNamespace; // optional: pack-catalog cache, absent in older deploys
   NEON_API_KEY: string;
   NEON_PROJECT_ID: string;
   LAB_API_KEY: string;
@@ -4342,12 +4343,13 @@ const AGENT_PACK_METADATA: Record<string, { name: string; description: string; t
   'eu-telecom':   { name: 'EU Telecom',         description: 'EU telecom with GDPR consent and retention modelling.',                   tables: 13, compliance: ['GDPR'] },
 };
 
-// Row counts that actually have a pre-generated SQL pack in R2, verified
-// object-by-object on 2026-07-27. DATASET_PRICING is a *billing* table —
-// it prices tiers that may not be uploaded — so the catalog must not be
-// derived from it. Ground truth is the bucket: when a pack is uploaded or
-// removed, update this map in the same change.
-const AVAILABLE_SIZES: Record<string, number[]> = {
+// Fallback only — used when the R2 probe *fails* (network error, bucket
+// unreachable), never when it succeeds and simply finds nothing. Ground
+// truth is the bucket itself; see probePackAvailableSizes below. Values
+// verified object-by-object on 2026-07-27. Run
+// POST /v1/agent/packs/refresh after uploading new packs to R2 to drop
+// the cache immediately rather than waiting out the 5-minute TTL.
+const FALLBACK_SIZES: Record<string, number[]> = {
   'us-banking':    [5000, 10000, 50000],
   'oncology':      [5000, 50000, 100000, 500000, 1000000],
   'healthcare':    [5000, 50000, 100000, 500000, 1000000],
@@ -4360,16 +4362,82 @@ const AVAILABLE_SIZES: Record<string, number[]> = {
   'eu-telecom':    [5000, 10000, 50000, 100000, 500000],
 };
 
-// Build the pack catalog from AVAILABLE_SIZES — the packs that exist in
-// R2 — not from DATASET_PRICING. Deriving it from the price table made
-// the catalog advertise tiers that were priced but never uploaded, so an
-// agent that trusted it got template_rows_unavailable at claim time.
-// Display fields still come from AGENT_PACK_METADATA.
-function buildAgentPackCatalog() {
+// Row counts the claim endpoint might be asked for. Each is probed
+// against R2 by object key; anything not in the bucket is not offered.
+const CANDIDATE_SIZES = [1000, 5000, 10000, 50000, 100000, 500000, 1000000];
+
+// Row-count label used in R2 object keys — must stay identical to the
+// label POST /v1/agent/databases builds, or the catalog will advertise
+// a size the claim endpoint then fails to find.
+function rowsToSizeLabel(rows: number): string {
+  return rows >= 1000 ? `${rows / 1000}k` : String(rows);
+}
+
+// Probe R2 for the sizes a template actually has. Returns null (not [])
+// when the bucket itself is unreachable, so callers can tell "this pack
+// has no sizes" apart from "we could not find out" — the first is a real
+// answer, the second is when the fallback table applies.
+async function probePackAvailableSizes(env: Env, templateId: string): Promise<number[] | null> {
+  try {
+    const results = await Promise.all(
+      CANDIDATE_SIZES.map(async (size) => {
+        const key = `templates/${templateId}-${rowsToSizeLabel(size)}.sql`;
+        const obj = await env.TEMPLATES.head(key);
+        return obj ? size : null;
+      })
+    );
+    return results.filter((s): s is number => s !== null);
+  } catch {
+    return null; // bucket unreachable — caller falls back
+  }
+}
+
+const PACK_SIZES_CACHE_TTL = 300; // 5 minutes
+const PACK_SIZES_CACHE_PREFIX = 'pack-sizes:';
+
+// Cached wrapper around the probe. KV is optional: without the binding
+// this still works, it just probes R2 on every request.
+async function getCachedPackSizes(env: Env, templateId: string): Promise<number[]> {
+  const cacheKey = `${PACK_SIZES_CACHE_PREFIX}${templateId}`;
+
+  if (env.KV) {
+    try {
+      const cached = await env.KV.get(cacheKey);
+      if (cached) return JSON.parse(cached) as number[];
+    } catch { /* cache miss or KV error — probe instead */ }
+  }
+
+  const sizes = await probePackAvailableSizes(env, templateId);
+
+  // Probe failed outright: serve the last-known-good table rather than
+  // silently reporting the catalog as empty.
+  if (sizes === null) return FALLBACK_SIZES[templateId] || [];
+
+  // A successful probe is authoritative even when it finds nothing —
+  // an empty result means the pack genuinely has no SQL in the bucket,
+  // and offering FALLBACK_SIZES here is what caused the original bug.
+  if (env.KV) {
+    try {
+      await env.KV.put(cacheKey, JSON.stringify(sizes), { expirationTtl: PACK_SIZES_CACHE_TTL });
+    } catch { /* cache write failure is non-fatal */ }
+  }
+
+  return sizes;
+}
+
+// Build the pack catalog from live R2 availability. It iterates
+// AGENT_TEMPLATES, not AGENT_PACK_METADATA, so the catalog can only ever
+// list packs the claim endpoint will actually accept. Display fields come
+// from AGENT_PACK_METADATA; row counts come from the bucket.
+async function buildAgentPackCatalog(env: Env) {
+  const entries = await Promise.all(
+    AGENT_TEMPLATES.map(async (id) => ({ id, sizes: await getCachedPackSizes(env, id) }))
+  );
+
   const packs = [];
-  for (const [id, sizes] of Object.entries(AVAILABLE_SIZES)) {
+  for (const { id, sizes } of entries) {
+    if (sizes.length === 0) continue; // nothing in R2 — not offerable
     const rowCounts = [...sizes].sort((a, b) => a - b);
-    if (rowCounts.length === 0) continue;
     const meta = AGENT_PACK_METADATA[id] || { name: id, description: `${id} synthetic dataset.`, tables: 0, compliance: [] };
     packs.push({
       id,
@@ -4379,7 +4447,7 @@ function buildAgentPackCatalog() {
       available_rows: rowCounts,
       max_rows: rowCounts[rowCounts.length - 1],
       min_rows: rowCounts[0],
-      default_rows: 5000,
+      default_rows: rowCounts.includes(5000) ? 5000 : rowCounts[0],
       compliance: meta.compliance,
       docs_url: `https://realitydb.dev/docs/packs/${id}`,
     });
@@ -4844,8 +4912,38 @@ app.get('/v1/agent/packs', async (c) => {
   const rl = await checkRateLimit(env, key.id as string, key.tier as string);
   if (!rl.allowed) return rateLimitError(c, key.tier as string, rl.limit);
 
-  const packs = buildAgentPackCatalog();
+  const packs = await buildAgentPackCatalog(env);
   return c.json({ packs, total: packs.length });
+});
+
+// Admin: drop the cached pack-availability entries and return a freshly
+// probed catalog. Call this straight after uploading a pack to R2 instead
+// of waiting out the 5-minute TTL. Guarded by the master LAB_API_KEY.
+app.post('/v1/agent/packs/refresh', async (c) => {
+  const env = c.env;
+  const apiKey = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-API-Key');
+  if (!authenticate(apiKey, env)) {
+    return agentError(c, 401, 'unauthorized', 'Refreshing the pack catalog requires the master API key.');
+  }
+
+  let cleared = 0;
+  if (env.KV) {
+    try {
+      // KV list is paginated; drain it so a large cache is fully cleared.
+      let cursor: string | undefined;
+      do {
+        const page = await env.KV.list({ prefix: PACK_SIZES_CACHE_PREFIX, cursor });
+        await Promise.all(page.keys.map((k) => env.KV!.delete(k.name)));
+        cleared += page.keys.length;
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
+    } catch (e: any) {
+      return agentError(c, 500, 'cache_clear_failed', e?.message || String(e));
+    }
+  }
+
+  const packs = await buildAgentPackCatalog(env);
+  return c.json({ packs, total: packs.length, refreshed: true, cache_entries_cleared: cleared, cache_enabled: Boolean(env.KV) });
 });
 
 // ENDPOINT 4 — current quota / plan details for this key.
