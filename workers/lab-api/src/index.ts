@@ -38,7 +38,7 @@ const TIER_LIMITS: Record<string, { maxRows: number; maxActiveLabs: number; down
 
 const DATASET_PRICING: Record<string, Record<string, number>> = {
   banking:        { '5k': 0, '50k': 4900, '100k': 7900, '500k': 29900, '1000k': 49900 },
-  'us-banking':   { '5k': 0, '50k': 4900, '100k': 7900, '500k': 29900, '1000k': 49900 },
+  'us-banking':   { '5k': 0, '10k': 2500, '50k': 4900, '100k': 7900, '500k': 29900, '1000k': 49900 },
   oncology:       { '5k': 0, '50k': 9900, '100k': 14900, '500k': 29900, '1000k': 49900 },
   healthcare:     { '5k': 0, '50k': 9900, '100k': 14900, '500k': 29900, '1000k': 49900 },
   'supply-chain': { '5k': 0, '50k': 4900, '100k': 7900, '500k': 29900, '1000k': 49900 },
@@ -4322,34 +4322,53 @@ const AGENT_TEMPLATES = ['us-banking', 'oncology', 'healthcare', 'supply-chain',
 // which template+rows combos exist). This map only supplies the label,
 // blurb, table count, and compliance tags a catalog needs.
 const AGENT_PACK_METADATA: Record<string, { name: string; description: string; tables: number; compliance: string[] }> = {
+// Table counts are the number of tables a claim actually lands in the
+// public schema — the pack's own tables plus the _realitydb_meta
+// watermark table the generator appends. They therefore match the
+// `tables` field a claim returns (which counts pg_tables). Counted on
+// 2026-07-27 from apps/cli/dist/packs/*.json (+1 watermark); re-count
+// after regenerating a pack rather than editing these by hand.
   banking:        { name: 'Banking',            description: 'Retail banking: customers, accounts, transactions, cards, loans.',        tables: 16, compliance: ['SOC2', 'PCI-DSS'] },
-  'us-banking':   { name: 'US Banking',         description: 'US retail banking with ACH, wires, and Reg-compliant account types.',     tables: 16, compliance: ['SOC2', 'PCI-DSS'] },
-  oncology:       { name: 'Oncology',           description: 'Cancer care: patients, diagnoses, treatments, labs, clinical trials.',    tables: 20, compliance: ['HIPAA'] },
-  healthcare:     { name: 'Healthcare',         description: 'General healthcare: encounters, providers, claims, prescriptions.',       tables: 20, compliance: ['HIPAA'] },
+  'us-banking':   { name: 'US Banking',         description: 'US retail banking with ACH, wires, and Reg-compliant account types.',     tables: 11, compliance: ['SOC2', 'PCI-DSS'] },
+  oncology:       { name: 'Oncology',           description: 'Cancer care: patients, diagnoses, treatments, labs, clinical trials.',    tables: 21, compliance: ['HIPAA'] },
+  healthcare:     { name: 'Healthcare',         description: 'General healthcare: encounters, providers, claims, prescriptions.',       tables: 15, compliance: ['HIPAA'] },
   'supply-chain': { name: 'Supply Chain',       description: 'Suppliers, warehouses, shipments, inventory, purchase orders.',           tables: 24, compliance: ['SOC2'] },
   aml:            { name: 'AML / Fraud',        description: 'Anti-money-laundering: entities, transfers, alerts, SAR cases.',          tables: 18, compliance: ['SOC2', 'BSA-AML'] },
-  fintech:        { name: 'Fintech',            description: 'Neobank / wallet: users, ledgers, payments, KYC records.',                tables: 16, compliance: ['SOC2', 'PCI-DSS'] },
-  telecom:        { name: 'Telecom',            description: 'Subscribers, plans, CDRs, billing, network usage.',                       tables: 18, compliance: ['SOC2'] },
-  universal:      { name: 'Universal',          description: 'Domain-agnostic relational sampler for generic SQL testing.',             tables: 12, compliance: [] },
-  'eu-banking':   { name: 'EU Banking',         description: 'SEPA / PSD2 retail banking with GDPR-shaped personal data.',              tables: 16, compliance: ['GDPR', 'PSD2'] },
-  'eu-healthcare':{ name: 'EU Healthcare',      description: 'EU healthcare records with GDPR special-category handling.',              tables: 20, compliance: ['GDPR'] },
-  'eu-telecom':   { name: 'EU Telecom',         description: 'EU telecom with GDPR consent and retention modelling.',                   tables: 18, compliance: ['GDPR'] },
+  fintech:        { name: 'Fintech',            description: 'Neobank / wallet: users, ledgers, payments, KYC records.',                tables: 10, compliance: ['SOC2', 'PCI-DSS'] },
+  telecom:        { name: 'Telecom',            description: 'Subscribers, plans, CDRs, billing, network usage.',                       tables: 22, compliance: ['SOC2'] },
+  universal:      { name: 'Universal',          description: 'Domain-agnostic relational sampler for generic SQL testing.',             tables: 7, compliance: [] },
+  'eu-banking':   { name: 'EU Banking',         description: 'SEPA / PSD2 retail banking with GDPR-shaped personal data.',              tables: 13, compliance: ['GDPR', 'PSD2'] },
+  'eu-healthcare':{ name: 'EU Healthcare',      description: 'EU healthcare records with GDPR special-category handling.',              tables: 15, compliance: ['GDPR'] },
+  'eu-telecom':   { name: 'EU Telecom',         description: 'EU telecom with GDPR consent and retention modelling.',                   tables: 13, compliance: ['GDPR'] },
 };
 
-// Convert a DATASET_PRICING row label ('5k','100k','1000k') to a number.
-function parseRowLabelToNumber(label: string): number {
-  const m = label.match(/^(\d+)k$/);
-  if (m) return parseInt(m[1], 10) * 1000;
-  return parseInt(label, 10) || 0;
-}
+// Row counts that actually have a pre-generated SQL pack in R2, verified
+// object-by-object on 2026-07-27. DATASET_PRICING is a *billing* table —
+// it prices tiers that may not be uploaded — so the catalog must not be
+// derived from it. Ground truth is the bucket: when a pack is uploaded or
+// removed, update this map in the same change.
+const AVAILABLE_SIZES: Record<string, number[]> = {
+  'us-banking':    [5000, 10000, 50000],
+  'oncology':      [5000, 50000, 100000, 500000, 1000000],
+  'healthcare':    [5000, 50000, 100000, 500000, 1000000],
+  'supply-chain':  [5000, 50000, 100000, 500000, 1000000],
+  'fintech':       [5000, 50000, 100000, 500000, 1000000],
+  'telecom':       [5000, 50000, 100000, 500000, 1000000],
+  'universal':     [5000, 50000, 100000, 500000, 1000000],
+  'eu-banking':    [5000, 10000, 50000, 100000, 500000],
+  'eu-healthcare': [5000, 10000, 50000, 100000, 500000],
+  'eu-telecom':    [5000, 10000, 50000, 100000, 500000],
+};
 
-// Build the pack catalog from the existing DATASET_PRICING config (the
-// source of truth for provisionable template+rows combos). Row bounds
-// come from the price tiers; display fields from AGENT_PACK_METADATA.
+// Build the pack catalog from AVAILABLE_SIZES — the packs that exist in
+// R2 — not from DATASET_PRICING. Deriving it from the price table made
+// the catalog advertise tiers that were priced but never uploaded, so an
+// agent that trusted it got template_rows_unavailable at claim time.
+// Display fields still come from AGENT_PACK_METADATA.
 function buildAgentPackCatalog() {
   const packs = [];
-  for (const [id, tiers] of Object.entries(DATASET_PRICING)) {
-    const rowCounts = Object.keys(tiers).map(parseRowLabelToNumber).filter((n) => n > 0).sort((a, b) => a - b);
+  for (const [id, sizes] of Object.entries(AVAILABLE_SIZES)) {
+    const rowCounts = [...sizes].sort((a, b) => a - b);
     if (rowCounts.length === 0) continue;
     const meta = AGENT_PACK_METADATA[id] || { name: id, description: `${id} synthetic dataset.`, tables: 0, compliance: [] };
     packs.push({
@@ -4357,9 +4376,10 @@ function buildAgentPackCatalog() {
       name: meta.name,
       description: meta.description,
       tables: meta.tables,
+      available_rows: rowCounts,
       max_rows: rowCounts[rowCounts.length - 1],
       min_rows: rowCounts[0],
-      default_rows: rowCounts[0], // smallest tier (the free 5k) is the default
+      default_rows: 5000,
       compliance: meta.compliance,
       docs_url: `https://realitydb.dev/docs/packs/${id}`,
     });
