@@ -4315,7 +4315,7 @@ function agentTierLimits(tier: string) {
 // 'banking' and 'aml' were removed on 2026-07-27: neither has any pack in
 // R2, so every claim against them failed the bucket check with
 // template_rows_unavailable. Re-add once their SQL is uploaded.
-const AGENT_TEMPLATES = ['us-banking', 'oncology', 'healthcare', 'supply-chain', 'fintech', 'telecom', 'universal', 'eu-banking', 'eu-healthcare', 'eu-telecom'];
+const AGENT_TEMPLATES = ['us-banking', 'oncology', 'healthcare', 'supply-chain', 'fintech', 'telecom', 'universal', 'eu-banking', 'eu-healthcare', 'eu-telecom', 'pipelinekit-demo'];
 
 // Human-facing display metadata for the pack catalog (GET /v1/agent/packs).
 // The provisionable row bounds are NOT taken from here — they are derived
@@ -4341,6 +4341,7 @@ const AGENT_PACK_METADATA: Record<string, { name: string; description: string; t
   'eu-banking':   { name: 'EU Banking',         description: 'SEPA / PSD2 retail banking with GDPR-shaped personal data.',              tables: 13, compliance: ['GDPR', 'PSD2'] },
   'eu-healthcare':{ name: 'EU Healthcare',      description: 'EU healthcare records with GDPR special-category handling.',              tables: 15, compliance: ['GDPR'] },
   'eu-telecom':   { name: 'EU Telecom',         description: 'EU telecom with GDPR consent and retention modelling.',                   tables: 13, compliance: ['GDPR'] },
+  'pipelinekit-demo': { name: 'PipelineKit Demo', description: 'Orders + customers schema for the PipelineKit postgres-to-duckdb blueprint. Integer sequential PKs, valid status enum, 100% referential integrity, dbt-compatible.', tables: 3, compliance: ['SOC2'] },
 };
 
 // Fallback only — used when the R2 probe *fails* (network error, bucket
