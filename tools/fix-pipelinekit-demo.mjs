@@ -4,8 +4,13 @@
 // The RealityDB engine cannot express sequential integer keys, unique
 // emails, bounded date ranges, cross-table temporal ordering, or a
 // constant column value. Rather than change the engine (owned elsewhere),
-// this script rewrites the generated INSERT rows in place. It is
-// deterministic: same input + same seed produces byte-identical output.
+// this script rewrites the generated INSERT rows in place.
+//
+// Deterministic apart from _loaded_at: the same input and seed always
+// produce the same keys, emails, and dates. _loaded_at is stamped from
+// the wall clock at run time on purpose — dbt source freshness errors
+// after 24h, so a hardcoded value would go stale overnight. Re-run this
+// script to refresh it before a demo.
 //
 // Usage: node fix-pipelinekit-demo.mjs <input.sql> [output.sql]
 
@@ -14,7 +19,9 @@ import { readFileSync, writeFileSync } from 'fs';
 const INPUT = process.argv[2];
 const OUTPUT = process.argv[3] || INPUT;
 const SEED = 42;
-const LOADED_AT = '2026-07-27 00:00:00+00'; // Transform 6 constant
+// Transform 6 constant — one value for every row, stamped at run time so
+// it always sits inside dbt's 24h source-freshness window.
+const LOADED_AT = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '+00');
 const BATCH_SIZE = 100;
 
 if (!INPUT) {
