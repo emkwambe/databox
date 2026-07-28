@@ -239,6 +239,21 @@ for (let i = blockSpans.length - 1; i >= 0; i--) {
   out = out.slice(0, span.start) + replacement + out.slice(span.end);
 }
 
+// ── Transform 7 — drop table-level FOREIGN KEY constraints ───────────
+// The generator emits `REFERENCES "customers"("customer_id")`, but it only
+// marks a column PRIMARY KEY when that column is literally named `id`.
+// customer_id therefore has no unique constraint, and Postgres rejects the
+// orders DDL with "there is no unique constraint matching given keys for
+// referenced table". The orders table is then never created and every
+// orders INSERT fails — which is exactly the half-seeded database this
+// pack produced. Referential integrity is already guaranteed by T1 (the
+// FK remap) and asserted by the validator, so the constraint is dropped
+// rather than propped up with a synthetic unique index.
+const FK_RE = /,\n\s*CONSTRAINT "[^"]+" FOREIGN KEY \([^)]*\) REFERENCES "[^"]+"\("[^"]+"\)/g;
+const fkRemoved = (out.match(FK_RE) || []).length;
+out = out.replace(FK_RE, '');
+log.push(`T7 FK constraints removed: ${fkRemoved}`);
+
 writeFileSync(OUTPUT, out, 'utf8');
 
 console.log('pipelinekit-demo post-process');
