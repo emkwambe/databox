@@ -239,20 +239,52 @@ for (let i = blockSpans.length - 1; i >= 0; i--) {
   out = out.slice(0, span.start) + replacement + out.slice(span.end);
 }
 
-// ── Transform 7 — drop table-level FOREIGN KEY constraints ───────────
-// The generator emits `REFERENCES "customers"("customer_id")`, but it only
-// marks a column PRIMARY KEY when that column is literally named `id`.
-// customer_id therefore has no unique constraint, and Postgres rejects the
-// orders DDL with "there is no unique constraint matching given keys for
-// referenced table". The orders table is then never created and every
-// orders INSERT fails — which is exactly the half-seeded database this
-// pack produced. Referential integrity is already guaranteed by T1 (the
-// FK remap) and asserted by the validator, so the constraint is dropped
-// rather than propped up with a synthetic unique index.
-const FK_RE = /,\n\s*CONSTRAINT "[^"]+" FOREIGN KEY \([^)]*\) REFERENCES "[^"]+"\("[^"]+"\)/g;
-const fkRemoved = (out.match(FK_RE) || []).length;
-out = out.replace(FK_RE, '');
-log.push(`T7 FK constraints removed: ${fkRemoved}`);
+// ── Transform 7 — real PRIMARY KEY + FOREIGN KEY constraints ─────────
+// The generator only marks a column PRIMARY KEY when it is literally named
+// `id`, so both keys ship as bare INTEGER NOT NULL. That left
+// customers.customer_id without a unique constraint, and Postgres rejects
+// a REFERENCES against it ("there is no unique constraint matching given
+// keys for referenced table") — the orders table was never created and
+// every orders INSERT failed. Promoting both keys to PRIMARY KEY fixes the
+// cause, so the FK can be declared rather than dropped: uniqueness and
+// referential integrity end up enforced by the database, not just asserted
+// by this script.
+//
+// Each edit is scoped to its own CREATE TABLE block on purpose.
+// `"customer_id" INTEGER NOT NULL,` appears in BOTH tables — it is the PK
+// in customers and the FK column in orders — so a global replace would
+// make orders.customer_id a PRIMARY KEY and every repeat purchaser would
+// collide on insert. Every step is a no-op if the constraint is already
+// present, so re-running the script is safe.
+function editCreateTable(text, table, fn) {
+  const re = new RegExp(`(CREATE TABLE "${table}" \\()([\\s\\S]*?)(\\n\\);)`);
+  const m = text.match(re);
+  if (!m) return { text, changed: false };
+  const body = fn(m[2]);
+  if (body === m[2]) return { text, changed: false };
+  return { text: text.replace(re, `$1${body.replace(/\$/g, '$$$$')}$3`), changed: true };
+}
+
+const addPk = (col) => (body) =>
+  body.includes('PRIMARY KEY')
+    ? body
+    : body.replace(`"${col}" INTEGER NOT NULL`, `"${col}" INTEGER NOT NULL PRIMARY KEY`);
+
+let pkAdded = 0;
+for (const [table, col] of [['customers', 'customer_id'], ['orders', 'order_id']]) {
+  const r = editCreateTable(out, table, addPk(col));
+  out = r.text;
+  if (r.changed) pkAdded++;
+}
+
+const withFk = (body) =>
+  body.includes('FOREIGN KEY')
+    ? body
+    : `${body},\n  CONSTRAINT "fk_orders_customer_id" FOREIGN KEY ("customer_id") REFERENCES "customers"("customer_id")`;
+const fkResult = editCreateTable(out, 'orders', withFk);
+out = fkResult.text;
+
+log.push(`T7 constraints: ${pkAdded} PRIMARY KEY added, FK ${fkResult.changed ? 'restored' : 'already present'}`);
 
 writeFileSync(OUTPUT, out, 'utf8');
 
